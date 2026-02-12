@@ -1,0 +1,802 @@
+Workflow:
+/*-
+ * #%L
+ * meghdootAugmentation.ts
+ * %%
+ * Copyright (C) 2024 PSCoE
+ * %%
+ * TODO: Define header text
+ * #L%
+ */
+import { Workflow, Out } from "vrotsc-annotations";
+import { VraBaseService } from "../../actions/vra/services/VraBaseService";
+import { Logger } from "com.vmware.pscoe.library.ts.logging/Logger";
+import { VcProvider } from "../../actions/vc/VcProvider";
+import { ResourceElementAccessor } from "com.vmware.pscoe.library.ts.util/ResourceElementAccessor";
+import { Locking } from "com.vmware.pscoe.library.ts.util";
+import { EmailService } from "../../actions/email/EmailService";
+
+@Workflow({
+    name: "Manage VM Snapshot",
+    path: "SBI/Day2",
+    description: "Create a Snapshot of VM",
+    attributes: {
+    },
+    input: {
+        machineName: {
+            type: "string",
+            description: "List of VMs",
+            required: true
+        },
+        deploymentId: {
+            type: "string"
+        },
+        action: {
+            type: "string"
+        },
+        snapshotName: {
+            type: "string",
+        }
+    }
+})
+export class ManageVMSnapshot {
+    public create(machineName: string, deploymentId: string, action: "Revert" | "Extend" | "Delete", snapshotName: string): void {
+        const logger = Logger.getLogger('Create Snapshot Workflow');
+        const vraBaseService = new VraBaseService();
+        const machine = vraBaseService.getAllMachinesOdataByName([machineName]).filter(vm => {
+            return vm.deploymentId === deploymentId;
+        }).pop();
+        const email = new EmailService();
+        const startDate = new Date();
+        startDate.setDate(startDate.getDate() + 2)
+        const expiration = startDate.getTime();
+        const nameWithExpiration = `${machine.name}-${expiration}`;
+        const snapshotDescription = "Created via Aria Automation - DELETE SNAPSHOT ONLY VIA vRA";
+        if (action === "Extend") {
+            logger.info(`Extending snapshot life ${snapshotName}`);
+            const vm = new VcProvider().getVcVmByUuidThruSdk(machine.externalId);
+            vm.snapshot.currentSnapshot.renameSnapshot(nameWithExpiration, snapshotDescription);
+            System.sleep(500000); // Waiting Aria Datacollection
+        } else if (action === "Revert") {
+            logger.info(`Reverting to snapshot ${snapshotName}`);
+            const snapshot = (vraBaseService.getSnapshots(machine.id) || []).find(snapshot => {
+                return snapshot.name === snapshotName;
+            });
+            if (snapshot) {
+                vraBaseService.revertToSnapshot(machine, snapshot.id)
+            }
+        }
+        else if (action === "Delete") {
+            logger.info('Deleting the snapshot $(snapshotName}');
+            const snapshot = (vraBaseService.getSnapshots(machine.id) || []).find(snapshot => {
+                return snapshot.name === snapshotName;
+            });
+            vraBaseService.deleteSnapshot(machine, snapshot.id);
+            try {
+                LockingSystem.lockAndWait("scheduleForDeletion", "admin");
+                const element = "SBI/Repo/SnapshotsForDeletion.json";
+                const accessor = new ResourceElementAccessor(element, false);
+                const existing: any = accessor.asJSON() || {};
+                if (existing.hasOwnProperty(machineName)) {
+                    delete existing[machineName];
+                }
+                accessor.setContent(JSON.stringify(existing, null, 4), "application/json", false);
+                LockingSystem.unlock("scheduleForDeletion", "admin")
+            } catch (error) {
+                logger.error(error);
+            }
+        }
+        else {
+            logger.info(`Creating Snapshot for machine`);
+            logger.info(`Creating snapshot for vm [${machine.name}] with name ${nameWithExpiration}`);
+            vraBaseService.createSnapshot(machine, nameWithExpiration, snapshotDescription);
+
+        }
+        if (!action || action === "Extend") {
+            email.snapshotNotification(machineName, nameWithExpiration, startDate)
+            try {
+                LockingSystem.lockAndWait("scheduleForDeletion", "admin");
+                const element = "SBI/Repo/SnapshotsForDeletion.json";
+                const accessor = new ResourceElementAccessor(element, false);
+                const existing: any = accessor.asJSON() || {};
+                existing[machineName] = { "expiration": expiration, "deployment": deploymentId };
+                accessor.setContent(JSON.stringify(existing, null, 4), "application/json", false);
+                LockingSystem.unlock("scheduleForDeletion", "admin")
+            } catch (error) {
+                logger.error(error);
+            } finally {
+                LockingSystem.unlock("scheduleForDeletion", "admin")
+            }
+        }
+
+    }
+}
+
+
+
+Actions:
+/*-
+* #%L
+ * meghdootAugmentation.ts
+ * %%
+ * Copyright (C) 2024 PSCoE
+ * %%
+ * TODO: Define header text
+ * #L%
+*/
+import { Logger } from "com.vmware.pscoe.library.ts.logging/Logger";
+import AuthClientService from "com.vmware.pscoe.library.ts.vra.authentication/actions/AuthClientService";
+import { MachinesService } from "com.vmware.pscoe.ts.vra.iaas/services/MachinesService";
+import { ODataServiceFactory } from "../odata/oDataServiceFactory";
+import { FilterClause, FilterExpression, FilterExpressions, FilterOperation } from "../odata/oDataFilterExpressions";
+import { Machine } from "com.vmware.pscoe.ts.vra.iaas/models/Machine";
+import { GetMachinesParameters } from "com.vmware.pscoe.ts.vra.iaas/models/GetMachinesParameters";
+import { MachineResult } from "com.vmware.pscoe.ts.vra.iaas/models/MachineResult";
+import { CreateMachineSnapshotParameters } from "com.vmware.pscoe.ts.vra.iaas/models/CreateMachineSnapshotParameters";
+import { GetMachineSnapshotsParameters } from "com.vmware.pscoe.ts.vra.iaas/models/GetMachineSnapshotsParameters";
+import { DeleteMachineSnapshotParameters } from "com.vmware.pscoe.ts.vra.iaas/models/DeleteMachineSnapshotParameters";
+import { Snapshot } from "com.vmware.pscoe.ts.vra.iaas/models/Snapshot";
+import { RequestTrackerService } from "com.vmware.pscoe.ts.vra.iaas/services/RequestTrackerService";
+import { RequestTracker } from "com.vmware.pscoe.ts.vra.iaas/models/RequestTracker";
+import { RequestStatus } from "../../enums/RequestStatus"
+import { BlockDevice } from "com.vmware.pscoe.ts.vra.iaas/models/BlockDevice";
+const logger = Logger.getLogger("com.vmware.pscoe.sbi.meghdootAugmentation.ts.vra.services/VraBaseService");
+
+type RequestFunction = () => RequestTracker;
+
+export class VraBaseService {
+    private readonly vraClient: AuthClientService;
+    private readonly serviceFactory: ODataServiceFactory;
+    private readonly machineService: MachinesService;
+
+    constructor() {
+        this.vraClient = AuthClientService.withDefaultAuthentication();
+        this.serviceFactory = new ODataServiceFactory(this.vraClient);
+        this.machineService = new MachinesService(this.vraClient);
+    }
+
+    public getMachineById(machineId: string): Machine {
+
+        return this.machineService.getMachine({ path_id: machineId }).body;
+    }
+    public getMachineDisksById(machineId: string): BlockDevice[] {
+        logger.info(`Getting Machine Disks ${machineId}`);
+        return this.machineService.getMachineDisks({ path_id: machineId }).body.content;
+    }
+
+    public getMachineDisks(machineId: string): BlockDevice[] {
+        const machine = this.getMachineById(machineId);
+        if (machine) {
+            const diskIds = machine._links['disks']['hrefs'].map((url) => {
+                const [_prefix, diskId] = url.split('disks/');
+                return diskId;
+            });
+            return diskIds.map((diskId) => {
+                const response = this.machineService.getMachineDisk({
+                    "path_id": machineId,
+                    "path_diskId": diskId,
+                });
+                return response.body;
+            })
+        }
+        return [];
+    }
+
+    public getAllMachinesOdata(machinesIds: string[]): Machine[] {
+        const machineService = this.serviceFactory.createService(MachinesService);
+        const expressions = new FilterExpressions();
+        expressions.clause(FilterClause.OR);
+        machinesIds.forEach((machineId) => {
+            expressions.add(new FilterExpression("id", FilterOperation.EQUAL, machineId));
+        });
+        return machineService.query<GetMachinesParameters, MachineResult>("getMachines").filter(expressions.toString()).execAll().content;
+    }
+
+    public getAllMachinesOdataByName(machinesNames: string[]): Machine[] {
+        const machineService = this.serviceFactory.createService(MachinesService);
+        const expressions = new FilterExpressions();
+        expressions.clause(FilterClause.OR);
+        machinesNames.forEach((name) => {
+            expressions.add(new FilterExpression("name", FilterOperation.EQUAL, name));
+        });
+        return machineService.query<GetMachinesParameters, MachineResult>("getMachines").filter(expressions.toString()).execAll().content;
+    }
+
+    public getMachineByName(machineName: string): Machine {
+        logger.info(`Searching machine ${machineName}`);
+        const machineODataService = this.serviceFactory.createService(MachinesService);
+        const expressions = new FilterExpressions();
+        expressions.add(new FilterExpression("name", FilterOperation.EQUAL, machineName));
+        expressions.clause(FilterClause.AND);
+        const machines = machineODataService.query<GetMachinesParameters, MachineResult>("getMachines").filter(expressions.toString()).execAll();
+        return machines.content.pop();
+    }
+
+    public updateCustomProperty(machineId: string, propertyName: string, propertyValue: string): void {
+        logger.info("About to update custom property on machineId: " + machineId + ', property name: ' + propertyName + ', property value: ' + propertyValue);
+        const customProperties = {};
+        customProperties[propertyName] = propertyValue;
+        const updatePrams = {
+            path_id: machineId,
+            body_body: { customProperties: customProperties },
+        };
+
+        this.machineService.updateMachine(updatePrams);
+    }
+
+    public createSnapshot(machine: Machine, snapshotName: string, snapshotDescription?: string) {
+        logger.info(`Creating machine  ${machine.name}  Snapshot ...`);
+        const machinesService = new MachinesService(this.vraClient);
+        const parameters: CreateMachineSnapshotParameters = {
+            path_id: machine.id,
+            body_body: {
+                owner: machine.owner,
+                snapshotMemory: false,
+                name: snapshotName,
+                description: !!snapshotDescription ? snapshotDescription : "Automatic Snapshot by vRO",
+                orgId: machine.orgId,
+            },
+        };
+        this.executeRequestAndWait(() => {
+            return machinesService.createMachineSnapshot(parameters).body;
+        })
+    }
+
+    public unregisterVirtualMachine(machineId: string): any {
+        const response: any = this.vraClient.post(`/iaas/api/machines/${machineId}/operations/unregister`);
+        this.validateResponse(response, "");
+        return response;
+    }
+
+    public deleteSnapshot(machine: Machine, snapshotId: string): void {
+        logger.info(`Deleting machine  ${machine.name}  Snapshot ...`);
+        const machinesService = new MachinesService(this.vraClient);
+        const parameters: DeleteMachineSnapshotParameters = {
+            path_id: machine.id,
+            path_snapshotId: snapshotId,
+        };
+        this.executeRequestAndWait(() => {
+            return machinesService.deleteMachineSnapshot(parameters).body
+        })
+    }
+    public revertToSnapshot(machine: Machine, snapshotId: string): RequestTracker {
+        logger.info(`Reverting machine  ${machine.name}  Snapshot ...`);
+        const machinesService = new MachinesService(this.vraClient);
+        const parameters = {
+            path_id: machine.id,
+            path_snapshotId: snapshotId,
+            query_apiVersion: "2021-07-15"
+        };
+        return this.executeRequestAndWait(function () {
+            return machinesService.revertMachineSnapshot(parameters).body;
+        });
+    }
+
+    public getSnapshots(machineId: string): Snapshot[] {
+        const machinesService = new MachinesService(this.vraClient);
+        const parameters: GetMachineSnapshotsParameters = {
+            path_id: machineId
+        }
+        const response = machinesService.getMachineSnapshots(parameters);
+        this.validateResponse(response, `Error while fetching Machine snapshots`);
+        return response.body;
+    }
+
+    private validateResponse<T>(response: { status: number; body: T; }, errorMessage: string) {
+        if (response.status < 200 || response.status > 299) {
+            throw new Error(`${errorMessage}. Error ${JSON.stringify(response.body)}`);
+        }
+    }
+
+    /**
+     * Execute the provided callback function and wait for it to finish.
+     * @param callback function that returns ResultTracker
+     * @param pollTimeMilliseconds optional sleep time, will default to 5 seconds
+     */
+    public executeRequestAndWait(callback: RequestFunction, pollTimeMilliseconds?: number): RequestTracker {
+        const SLEEP_TIME_MILLISECONDS = 5000;
+        const trackerService = new RequestTrackerService(this.vraClient);
+        let resultTracker = callback();
+
+        while (resultTracker.status === RequestStatus.INPROGRESS) {
+            resultTracker = trackerService.getRequestTracker({
+                path_id: resultTracker.id
+            }).body;
+
+            logger.debug(`${resultTracker.progress}%`);
+            System.sleep(pollTimeMilliseconds ? pollTimeMilliseconds : SLEEP_TIME_MILLISECONDS);
+        }
+
+        if (!resultTracker.status || resultTracker.status === RequestStatus.FAILED) {
+            logger.error("Request failed!");
+            logger.error(`Name: ${resultTracker.name}`);
+            logger.error(`Status: ${resultTracker.status}`);
+            logger.error(`Message: ${resultTracker.message}`);
+
+            throw new Error(resultTracker.message);
+        } else {
+            logger.info("Request completed.");
+            logger.info(`Status: ${resultTracker.status}`);
+            logger.info(`Message: ${resultTracker.message}`);
+        }
+        return resultTracker;
+    }
+}
+
+
+/*-
+ * #%L
+ * meghdootAugmentation.ts
+ * %%
+ * Copyright (C) 2024 PSCoE
+ * %%
+ * TODO: Define header text
+ * #L%
+ */
+import { Logger } from "com.vmware.pscoe.library.ts.logging/Logger";
+const logger = Logger.getLogger("com.vmware.pscoe.sbi/vcService");
+import { VirtualMachine } from "../vc/VirtualMachine";
+
+export class VcProvider {
+
+    private readonly sdkConnections: VcSdkConnection[];
+    private readonly logger: Logger;
+
+    constructor(sdkConnection?: VcSdkConnection | VcSdkConnection[]) {
+        sdkConnection = sdkConnection || VcPlugin.allSdkConnections;
+        this.sdkConnections = Array.isArray(sdkConnection) ? sdkConnection : [sdkConnection];
+        this.logger = Logger.getLogger("com.vmware.pscoe.generali.vm.VirtualMachineCollector");
+    }
+
+    public getVcVmByUuidThruSdk(vmUuid: string): VcVirtualMachine {
+        // vcVm.uuid = vRAvm.externalId
+        const sdkConnections = VcPlugin.allSdkConnections;
+        let vCenterVm = null;
+        for (const sdkConnection of sdkConnections) {
+            try {
+                vCenterVm = sdkConnection.searchIndex.findByUuid(null, vmUuid, true, true);
+                if (!vCenterVm) {
+                    this.logger.debug(`VM by instance UUID : ${vmUuid}  NOT FOUND for SDK connection ${sdkConnection.name}`);
+                } else {
+                    this.logger.info(`VM by instance UUID : ${vmUuid} FOUND for SDK connection ${sdkConnection.name}`);
+                    break;
+                }
+
+            } catch (e) {
+                this.logger.debug(`Unable to find VM by instance UUID :${vmUuid}, for SDK connection ${sdkConnection.name}, will fallback to search by BIOS UUID, reason : ${e}`);
+                try {
+                    vCenterVm = sdkConnection.searchIndex.findByUuid(null, vmUuid, true, false);
+                    this.logger.debug(`Unable to find VM by BIOS UUID :${vmUuid}, for SDK connection ${sdkConnection.name} found`);
+                } catch (err) {
+                    this.logger.debug(`Unable to find VM by BIOS UUID :${vmUuid}, for SDK connection ${sdkConnection.name}, reason : ${err}`);
+                }
+            }
+        }
+        return vCenterVm;
+    }
+
+    public getVmByUuid(vmUuid: string, sdkConnection: VcSdkConnection): VcVirtualMachine {
+        let vCenterVm = null;
+        try {
+            this.logger.info(`Trying to find VM on vCenter ${sdkConnection.name}, with UUID: ${vmUuid}`);
+            vCenterVm = sdkConnection.searchIndex.findByUuid(null, vmUuid, true, true);
+            if (vCenterVm != null) {
+                this.logger.info("Resolved vCenter VM " + vCenterVm.name);
+            }
+        } catch (e) {
+            this.logger.warn(`Unable to find VM by instance UUID :${vmUuid}, for SDK connection ${sdkConnection.name}, reason : ${e}`);
+        }
+
+        return vCenterVm;
+    }
+
+    public getSdkConnection(vCenterUuid: string): VcSdkConnection {
+        const sdkConnection = VcPlugin.findSdkConnectionForUUID(vCenterUuid);
+        if (!sdkConnection) {
+            throw new Error(`No vCenter host configuration found with ID ${vCenterUuid}`);
+        }
+        return sdkConnection;
+    }
+
+    public getVmsByName(vmName: string): VirtualMachine[] {
+        this.logger.info(`Searching for VMs with name: ${vmName}`);
+        let vms: VirtualMachine[] = [];
+        this.sdkConnections.forEach(sdkConn => {
+            const currVms = this.collect(sdkConn, ["name"], vmName);
+            vms = vms.concat(currVms);
+        });
+        return vms;
+    }
+
+    private collect(sdkConn: VcSdkConnection, properties: string[] = ["name"], filter = ""): VirtualMachine[] {
+        let vmResult: VirtualMachine[] = [];
+        let propertyCollector: VcPropertyCollector;
+        let containerView: VcContainerView;
+
+        this.logger.info(`Collecting VMs from VC '${sdkConn.name}'.`);
+        this.logger.debug(`Collecting criteria. Properties: ${properties} and Filter: ${filter}`);
+
+        try {
+            propertyCollector = this.initPropertyCollector(sdkConn);
+            containerView = this.initContainerView(sdkConn);
+
+            const filterSpec = this.createPropertyFilterSpec(containerView, properties);
+
+            // By default Property Collector retrievs up to 100 objects.
+            let retrievedResult = propertyCollector.retrievePropertiesEx([filterSpec], new VcRetrieveOptions());
+            vmResult = vmResult.concat(this.processRetrievedResult(sdkConn, retrievedResult, filter));
+
+            // Get VMs (if any) which are not retrieved with first collection.
+            while (retrievedResult && retrievedResult.token) {
+                this.logger.debug(`Continue collecting VMs... Token: ${retrievedResult.token}`);
+                retrievedResult = propertyCollector.continueRetrievePropertiesEx(retrievedResult.token);
+                vmResult = vmResult.concat(this.processRetrievedResult(sdkConn, retrievedResult, filter));
+            }
+
+        } finally {
+            if (propertyCollector) {
+                this.disposePropertyCollector(propertyCollector);
+            }
+            if (containerView) {
+                this.disposeContainerView(containerView);
+            }
+        }
+
+        this.logger.debug(`Collected ${vmResult.length} VMs.`);
+
+        return vmResult;
+    }
+
+    private initPropertyCollector(sdkConn: VcSdkConnection): VcPropertyCollector {
+        this.logger.debug(`Creating a property collector instance...`);
+        return sdkConn.propertyCollector.createPropertyCollector();
+    }
+
+    private disposePropertyCollector(propCollector: VcPropertyCollector): void {
+        this.logger.debug(`Disposing a property collector instance...`);
+        propCollector.destroyPropertyCollector();
+    }
+
+    private initContainerView(sdkConn: VcSdkConnection): VcContainerView {
+        this.logger.debug(`Creating a container view instance...`);
+        const containerRoot = sdkConn.rootFolder;
+        const viewManager = sdkConn.viewManager;
+        return viewManager.createContainerView(containerRoot, ["VirtualMachine"], true);
+    }
+
+    private disposeContainerView(containerView: VcContainerView): void {
+        this.logger.debug(`Disposing a container view instance...`);
+        containerView.destroyView();
+    }
+
+    private createPropertyFilterSpec(containerView: VcContainerView, properties: string[]): VcPropertyFilterSpec {
+        const tSpec = new VcTraversalSpec("traverseEntities", "ContainerView", "view", false, []);
+        const oSpec = new VcObjectSpec(containerView, true, [tSpec]);
+        const propertySpecs = [new VcPropertySpec("VirtualMachine", false, properties)];
+        return new VcPropertyFilterSpec(propertySpecs, [oSpec], true);
+    }
+
+    private processRetrievedResult(sdkConn: VcSdkConnection, retrievedResult: VcRetrieveResult, filter: string): VirtualMachine[] {
+        if (!retrievedResult || !retrievedResult.objects || retrievedResult.objects.length === 0) {
+            return [];
+        }
+        const vmResult: VirtualMachine[] = [];
+        const regExPattern = new RegExp(filter);
+        retrievedResult.objects.forEach(vmContent => {
+            const vmProps = vmContent.propSet;
+            for (const element of vmProps) {
+                // @ts-ignore
+                if (regExPattern.test(element.val)) {
+                    const vcVm: VcVirtualMachine = VcPlugin.convertToVimManagedObject(sdkConn, vmContent.obj.moref);
+                    if (vcVm) {
+                        vmResult.push(new VirtualMachine(vcVm));
+                    }
+                    break;
+                }
+            }
+        });
+
+        return vmResult;
+    }
+}
+
+------------------------------------------------------------------------------------------------------------------------
+
+/*-
+ * #%L
+ * meghdootAugmentation.ts
+ * %%
+ * Copyright (C) 2024 PSCoE
+ * %%
+ * TODO: Define header text
+ * #L%
+ */
+import { ConfigElementAccessor } from 'com.vmware.pscoe.library.ts.util/ConfigElementAccessor';
+import { UserService } from '../ad/UserService';
+import { VraDeploymentService } from '../vra/services/VraDeploymentService';
+import { EmailProvider } from "./provider/EmailProvider";
+const ContextFactory = VROES.import("default").from("com.vmware.pscoe.library.context.ContextFactory");
+import { Logger } from "com.vmware.pscoe.library.ts.logging/Logger";
+const logger = Logger.getLogger("EmailService");
+import { ItsmTicket } from "../../types/ItsmTypes"
+import { Deployment } from 'com.vmware.pscoe.ts.vra.deployment/models/Deployment';
+
+const context = ContextFactory.createLazy([
+    "com.vmware.pscoe.library.context.workflow",
+    "com.vmware.pscoe.sbi.meghdootAugmentation.ts.actions.context.ad",
+    "com.vmware.pscoe.sbi.meghdootAugmentation.ts.actions.context.email",
+    "com.vmware.pscoe.sbi.meghdootAugmentation.ts.actions.context.subscription",
+    "com.vmware.pscoe.sbi.meghdootAugmentation.ts.actions.context.report",
+    "com.vmware.pscoe.sbi.meghdootAugmentation.ts.actions.context.testFailover",
+    "com.vmware.pscoe.sbi.meghdootAugmentation.ts.actions.context.actualFailover",
+]);
+
+export class EmailService {
+
+    constructor() {
+        //no constructor
+    }
+
+    public snapshotNotification(vmName: string, snapshotName: string, snapshotDeletionTime: Date) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "vmName": vmName,
+            "requestorName": context.requestorName,
+            "snapshotName": snapshotName,
+            "requestNumber": context.requestNumber,
+            "snapshotDeletionTime": snapshotDeletionTime.toLocaleDateString()
+
+        };
+        const emailProvider = new EmailProvider("snapshot");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+    }
+
+    public snapshotDeletionReminder(vmName: string, snapshotName: string, snapshotDeletionTime: Date, owner: string) {
+        const requestorEmail = new UserService().getEmailAddress(owner)
+        if (requestorEmail) {
+            const paramsJSON = {
+                "vmName": vmName,
+                "requestorName": owner,
+                "snapshotName": snapshotName,
+                "snapshotDeletionTime": snapshotDeletionTime.toLocaleDateString()
+
+            };
+            const emailProvider = new EmailProvider("snapshotDeletion");
+            emailProvider.sendEmail(requestorEmail, paramsJSON);
+        }
+    }
+
+    public mountISONotification(vmName: string, isoPath: string, unmountIsoTime: Date) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "vmName": vmName,
+            "requestorName": context.requestorName,
+            "isoPath": isoPath,
+            "requestNumber": context.requestNumber,
+            "unmountIsoTime": unmountIsoTime
+        };
+        const emailProvider = new EmailProvider("mountISO");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+    }
+    public requestReportNotification(attachments: any, totalRequests: number, failedRequests: number, successfulRequests: number) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "requestorName": context.requestorName,
+            "totalRequests": totalRequests,
+            "failedRequests": failedRequests,
+            "successfulRequests": successfulRequests,
+            "startDate": context.startDate,
+            "endDate": context.endDate
+        };
+        const emailProvider = new EmailProvider("requestReport");
+        emailProvider.sendEmailWithAttachments(requestorEmail, paramsJSON, attachments);
+    }
+
+    public approvalReportNotification(requestorName, requestNumber, submittedAfter) {
+        const requestorEmail = new UserService().getEmailAddress(requestorName)
+        const paramsJSON = {
+            "requestNumber": requestNumber,
+            "submittedAfter": submittedAfter,
+            "vraLink": context.emailConfigResolver$req().vraLink
+        };
+        const emailProvider = new EmailProvider("requestApprovalReport");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+    }
+
+    public checkReplicationStatus(vmDetails) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "vmDetails": vmDetails,
+            "requestorName": context.requestorName,
+
+        };
+        const emailProvider = new EmailProvider("checkReplicationSyncStatus");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+    }
+
+    public testFailoverScheduledNotification(recoveryPlanName: string, cleanUpScheduleDate: Date) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "requestorName": context.requestorName,
+            "requestNumber": context.requestNumber,
+            "recoveryPlanName": recoveryPlanName,
+            "departmentName": context.departmentName,
+            "applicationName": context.applicationName,
+            "cleanUpScheduleDate": cleanUpScheduleDate
+        };
+        const emailProvider = new EmailProvider("testFailoverScheduled");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+    }
+
+    public actualFailoverScheduledNotification(recoveryPlanName: string, scheduleDate: Date) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "requestorName": context.requestorName,
+            "requestNumber": context.requestNumber,
+            "recoveryPlanName": recoveryPlanName,
+            "departmentName": context.departmentName,
+            "applicationName": context.applicationName,
+            "scheduleDate": scheduleDate
+        };
+        const emailProvider = new EmailProvider("actualFailoverScheduled");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+    }
+
+    public testFailoverCompletedNotification(recoveryPlanName: string) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "requestorName": context.requestorName,
+            "requestNumber": context.requestNumber,
+            "recoveryPlanName": recoveryPlanName,
+        };
+        const emailProvider = new EmailProvider("testFailoverCompleted");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+    }
+
+    public testFailoverCleanupCompletedNotification(recoveryPlanName: string) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "requestorName": context.requestorName,
+            "requestNumber": context.requestNumber,
+            "recoveryPlanName": recoveryPlanName,
+        };
+        const emailProvider = new EmailProvider("testFailoverCleanupCompleted");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+
+    }
+
+    public testFailoverErrorNotification(recoveryPlanName: string, errorMessage: string) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "requestorName": context.requestorName,
+            "requestNumber": context.requestNumber,
+            "recoveryPlanName": recoveryPlanName,
+            "errorMessage": errorMessage,
+        };
+        const emailProvider = new EmailProvider("testFailoverError");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+    }
+
+    public deploymentReportNotification(deploymentInformation, resourceDetails, disclaimerInfo, attachments) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "requestor": context.requestorName,
+            "requestNumber": deploymentInformation.get("requestNumber"),
+            "requestedDeploymentName": deploymentInformation.get("deploymentName"),
+            "requestedLocation": deploymentInformation.get("requestedLocation"),
+            "requestedEnvironment": deploymentInformation.get("requestedEnvironment"),
+            "requestedMachineType": deploymentInformation.get("requestedMachineType"),
+            "departmentName": deploymentInformation.get("departmentName"),
+            "applicationName": deploymentInformation.get("applicationName"),
+            "applicationAPMID": deploymentInformation.get("applicationAPMID"),
+            "requestedVMSize": deploymentInformation.get("requestedVMSize"),
+            "numberOfInstances": deploymentInformation.get("numberOfInstances"),
+            "requestedOS": deploymentInformation.get("requestedOS"),
+            "isMultiTierBlueprint": deploymentInformation.get("isMultiTierBlueprint"),
+            "isSingleTierBlueprint": deploymentInformation.get("isSingleTierBlueprint"),
+            "requestedAppVMSize": deploymentInformation.get("requestedAppVMSize"),
+            "numberOfAppInstances": deploymentInformation.get("numberOfAppInstances"),
+            "requestedAppOS": deploymentInformation.get("requestedAppOS"),
+            "requestedWebVMSize": deploymentInformation.get("requestedWebVMSize"),
+            "numberOfWebInstances": deploymentInformation.get("numberOfWebInstances"),
+            "requestedWebOS": deploymentInformation.get("requestedWebOS"),
+            "requestedDbVMSize": deploymentInformation.get("requestedDbVMSize"),
+            "numberOfDbInstances": deploymentInformation.get("numberOfDbInstances"),
+            "requestedDbOS": deploymentInformation.get("requestedDbOS"),
+            "resources": resourceDetails,
+            "showLinuxDisclaimer": disclaimerInfo.showLinuxDisclaimer,
+            "showWindowsDisclaimer": disclaimerInfo.showWindowsDisclaimer
+        };
+        const emailProvider = new EmailProvider("sendSummaryEmail");
+        emailProvider.sendEmailWithAttachments(requestorEmail, paramsJSON, attachments);
+    }
+
+    public sendEmailForActivePassiveDRRequest(inputProperties: Properties) {
+        logger.info("sendEmailForActivePassiveDRRequest");
+        logger.info(`inputProperties : ${JSON.stringify(inputProperties)}`);
+        const configurationPath = "SBI/Email/Email Configurations";
+        const emailConfig = new ConfigElementAccessor(configurationPath);
+        const meghdootSupportEmail: string = emailConfig.get("meghdootSupportEmailId");
+        logger.info(`meghdootSupportEmail : ${meghdootSupportEmail}`);
+
+        const requestInputs = inputProperties.requestInputs;
+        const deploymentService = new VraDeploymentService();
+        const deployment = deploymentService.getDeploymentInfo(inputProperties.deploymentId);
+        logger.info(`deployment : ${JSON.stringify(deployment)}`);
+        const paramsJSON = {
+            "drType": requestInputs.DrType ? requestInputs.DrType : "N/A",
+            "deploymentName": deployment.name,
+            "location": requestInputs.location,
+            "environment": requestInputs.environment,
+            "applicationSegment": requestInputs.application,
+            "department": requestInputs.departmentName,
+            "applicationName": requestInputs.applicationName,
+            "applicationApmId": requestInputs.applicationApmId,
+            "vmSize": requestInputs.vmSize,
+            "vmCount": requestInputs.vmCount,
+            "osImage": requestInputs.osImage,
+            "installPaaS": requestInputs.installPaaS ? requestInputs.installPaaS : "N/A"
+        };
+        logger.info(`paramsJSON : ${JSON.stringify(paramsJSON)}`);
+        const emailProvider = new EmailProvider("activePassiveDRRequest");
+        emailProvider.sendEmail(meghdootSupportEmail, paramsJSON);
+    }
+    public cloneVMSuccessNotification(currentDeployment: Deployment, cloneNewDeployment: Deployment) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        System.log(`requestorEmail: ${requestorEmail}`);
+        const paramsJSON = {
+            "requestorName": context.requestorName,
+            "Current Deployment Name": currentDeployment.name,
+            "Current Deployment VM Name": currentDeployment.resources.filter(function (resource) {
+
+            })
+        };
+        const emailProvider = new EmailProvider("cloneVMSuccess");
+        emailProvider.sendNotificationEmailOnlyToRequestor(paramsJSON, requestorEmail);
+    }
+
+    public cloneVMFailureNotification(toAddresses: string) {
+        const emailProvider = new EmailProvider("cloneVMFailure");
+        emailProvider.sendEmail(toAddresses, {});
+    }
+
+    public itsmFailureNotification(toAddresses: string, itsmPayload: ItsmTicket) {
+        const emailProvider = new EmailProvider("itsmFailure");
+        emailProvider.sendEmail(toAddresses, itsmPayload);
+    }
+
+    public actualFailoverCompletedNotification(recoveryPlanName: string) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "requestorName": context.requestorName,
+            "recoveryPlanName": recoveryPlanName,
+            "failoverStartDateTime": context.failoverStartDateTime,
+            "departmentName": context.departmentName,
+            "applicationName": context.applicationName
+        };
+        const emailProvider = new EmailProvider("actualFailoverCompleted");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+    }
+
+    public actualFailoverErrorNotification(recoveryPlanName: string, errorMessage: string) {
+        const requestorEmail = new UserService().getEmailAddress(context.requestorName)
+        const paramsJSON = {
+            "requestorName": context.requestorName,
+            "recoveryPlanName": recoveryPlanName,
+            errorMessage,
+        };
+        const emailProvider = new EmailProvider("actualFailoverError");
+        emailProvider.sendEmail(requestorEmail, paramsJSON);
+    }
+
+    public projectReportNotification(attachments: any, toAddress: string) {
+        const paramsJSON = {
+        };
+        const emailProvider = new EmailProvider("projectReportUtilization");
+        emailProvider.sendEmailWithAttachments(toAddress, paramsJSON, attachments);
+    }
+
+}
+
+
+
